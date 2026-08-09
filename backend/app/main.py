@@ -65,13 +65,16 @@ async def root() -> dict[str, str]:
     return {
         "service": "InRisk Weather Explorer API",
         "docs": "/docs",
-        "health": "/health",
+        "health": "/api/health",
     }
 
 
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health", response_model=HealthResponse, include_in_schema=False)
+@app.get("/api/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(status="ok", storage_backend=settings.storage_backend)
 
 
+# Mount once without prefix (local/direct) and once under /api (Vercel rewrite keeps /api).
 app.include_router(weather_router)
+app.include_router(weather_router, prefix="/api")
