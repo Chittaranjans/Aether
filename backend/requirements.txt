@@ -5,4 +5,5 @@ pydantic==2.13.4
 pydantic-settings==2.15.0
 python-dotenv==1.2.2
 google-cloud-storage==3.13.1
+supabase==2.31.0
 python-multipart==0.0.32

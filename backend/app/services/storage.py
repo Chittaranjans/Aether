@@ -94,6 +94,206 @@ class LocalStorageClient(StorageClient):
             ) from exc
 
 
+class SupabaseStorageClient(StorageClient):
+    """Supabase Storage client (S3-compatible object storage)."""
+
+    def __init__(self, url: str, secret_key: str, bucket_name: str) -> None:
+        if not url or not secret_key:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "error",
+                    "message": "SUPABASE_URL and SUPABASE_SECRET_KEY must be configured",
+                },
+            )
+        if not bucket_name:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "error",
+                    "message": "SUPABASE_BUCKET is not configured",
+                },
+            )
+
+        try:
+            from supabase import create_client
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "error",
+                    "message": "supabase package is not installed",
+                },
+            ) from exc
+
+        try:
+            self.client = create_client(url, secret_key)
+            self.bucket_name = bucket_name
+            self._ensure_bucket()
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "error",
+                    "message": f"Failed to initialize Supabase client: {exc}",
+                },
+            ) from exc
+
+    def _ensure_bucket(self) -> None:
+        try:
+            buckets = self.client.storage.list_buckets()
+            names = {
+                getattr(bucket, "name", None) or bucket.get("name")  # type: ignore[union-attr]
+                for bucket in buckets
+            }
+            if self.bucket_name in names:
+                return
+            self.client.storage.create_bucket(
+                self.bucket_name,
+                options={"public": False},
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Bucket may already exist from a race; verify again before failing.
+            try:
+                buckets = self.client.storage.list_buckets()
+                names = {
+                    getattr(bucket, "name", None) or bucket.get("name")  # type: ignore[union-attr]
+                    for bucket in buckets
+                }
+                if self.bucket_name in names:
+                    return
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "error",
+                    "message": f"Failed to prepare Supabase bucket '{self.bucket_name}': {exc}",
+                },
+            ) from exc
+
+    def store_json(self, file_name: str, payload: dict[str, Any]) -> str:
+        raw = json.dumps(payload, indent=2).encode("utf-8")
+        try:
+            self.client.storage.from_(self.bucket_name).upload(
+                file_name,
+                raw,
+                file_options={
+                    "content-type": "application/json",
+                    "upsert": "true",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "error",
+                    "message": f"Failed to upload weather file to Supabase: {exc}",
+                },
+            ) from exc
+        return file_name
+
+    def list_files(self) -> list[WeatherFileMeta]:
+        files: list[WeatherFileMeta] = []
+        try:
+            listed = self.client.storage.from_(self.bucket_name).list(
+                "",
+                {
+                    "limit": 1000,
+                    "offset": 0,
+                    "sortBy": {"column": "created_at", "order": "desc"},
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "error",
+                    "message": f"Failed to list Supabase objects: {exc}",
+                },
+            ) from exc
+
+        for item in listed or []:
+            name = item.get("name") if isinstance(item, dict) else getattr(item, "name", None)
+            if not name or not str(name).startswith("weather_") or not str(name).endswith(".json"):
+                continue
+
+            metadata = (
+                item.get("metadata")
+                if isinstance(item, dict)
+                else getattr(item, "metadata", None)
+            ) or {}
+            size = 0
+            if isinstance(metadata, dict):
+                size = int(metadata.get("size") or metadata.get("contentLength") or 0)
+
+            created_raw = (
+                item.get("created_at")
+                if isinstance(item, dict)
+                else getattr(item, "created_at", None)
+            ) or (
+                item.get("updated_at")
+                if isinstance(item, dict)
+                else getattr(item, "updated_at", None)
+            )
+            if created_raw:
+                created_at = str(created_raw).replace("+00:00", "Z")
+                if created_at.endswith("Z") is False and "T" in created_at:
+                    created_at = f"{created_at}Z" if "+" not in created_at else created_at
+            else:
+                created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+            files.append(
+                WeatherFileMeta(
+                    name=str(name),
+                    size=size,
+                    created_at=created_at,
+                )
+            )
+
+        files.sort(key=lambda item: item.created_at, reverse=True)
+        return files
+
+    def get_json(self, file_name: str) -> dict[str, Any]:
+        try:
+            raw = self.client.storage.from_(self.bucket_name).download(file_name)
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc).lower()
+            if "not found" in message or "404" in message or "object not found" in message:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"status": "error", "message": "not found"},
+                ) from exc
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "error",
+                    "message": f"Failed to read weather file from Supabase: {exc}",
+                },
+            ) from exc
+
+        if raw is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"status": "error", "message": "not found"},
+            )
+
+        try:
+            if isinstance(raw, bytes):
+                return json.loads(raw.decode("utf-8"))
+            return json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "error",
+                    "message": f"Stored Supabase object is not valid JSON: {exc}",
+                },
+            ) from exc
+
+
 class GCSStorageClient(StorageClient):
     """Google Cloud Storage client (free-tier friendly)."""
 
@@ -227,12 +427,21 @@ def build_storage_client(settings: Settings | None = None) -> StorageClient:
         return LocalStorageClient(settings.local_storage_dir)
     if backend == "gcs":
         return GCSStorageClient(settings.gcs_bucket_name)
+    if backend == "supabase":
+        return SupabaseStorageClient(
+            url=settings.supabase_url,
+            secret_key=settings.supabase_secret_key,
+            bucket_name=settings.supabase_bucket,
+        )
 
     raise HTTPException(
         status_code=500,
         detail={
             "status": "error",
-            "message": f"Unsupported STORAGE_BACKEND '{settings.storage_backend}'. Use 'local' or 'gcs'.",
+            "message": (
+                f"Unsupported STORAGE_BACKEND '{settings.storage_backend}'. "
+                "Use 'local', 'gcs', or 'supabase'."
+            ),
         },
     )
 
